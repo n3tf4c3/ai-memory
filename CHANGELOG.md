@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.5.0+fork.1] - 2026-11-18
+
 ### Fixed
 
 - Profile harvest no longer promotes five kinds of text that are not a habit
@@ -5949,7 +5951,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.5.0...HEAD
+[Unreleased]: https://github.com/n3tf4c3/ai-memory/compare/v3.5.0+fork.1...HEAD
+[3.5.0+fork.1]: https://github.com/n3tf4c3/ai-memory/releases/tag/v3.5.0+fork.1
 [3.5.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.0
 [3.4.7]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.7
 [3.4.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.6

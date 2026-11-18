@@ -1,0 +1,220 @@
+name: fork-image
+
+# Fork-only workflow (n3tf4c3/ai-memory): publishes the container image of a
+# fork release to the GitHub Container Registry.
+#
+# release.yml pushes images to Docker Hub only when DOCKERHUB_USERNAME and
+# DOCKERHUB_TOKEN are set, and this fork has neither. Run this workflow by hand
+# after release.yml has published the GitHub release for the tag. Like
+# release.yml, it reuses the release's native Linux tarballs (checked against
+# their published .sha256 files) with docker/Dockerfile's runtime-prebuilt
+# targets instead of recompiling. It lives in its own file so syncing the fork
+# with upstream never conflicts on release.yml.
+#
+# Docker tags cannot contain "+", so a tag such as v3.5.0+fork.1 is published
+# as ghcr.io/<owner>/ai-memory:3.5.0-fork.1. No `latest` tag is written.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (for example v3.5.0+fork.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-image-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  names:
+    name: resolve image names
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.names.outputs.version }}
+      image: ${{ steps.names.outputs.image }}
+      image_tag: ${{ steps.names.outputs.image_tag }}
+    steps:
+      - id: names
+        env:
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.]+)?$ ]]; then
+            echo "not a release tag: $TAG" >&2
+            exit 1
+          fi
+          version="${TAG#v}"
+          {
+            echo "version=${version}"
+            echo "image=ghcr.io/${REPO,,}"
+            echo "image_tag=${version//+/-}"
+          } >> "$GITHUB_OUTPUT"
+
+  image:
+    name: ${{ matrix.platform }} image
+    needs: names
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            artifact: ai-memory-linux-x86_64
+            target: runtime-prebuilt-amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            artifact: ai-memory-linux-aarch64
+            target: runtime-prebuilt-arm64
+            runner: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+
+      - name: Download and verify the release tarball
+        id: tarball
+        env:
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+          ARTIFACT: ${{ matrix.artifact }}
+          VERSION: ${{ needs.names.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts "dist/docker/${ARTIFACT}"
+          base="https://github.com/${REPO}/releases/download/${TAG//+/%2B}"
+          for file in "${ARTIFACT}.tar.gz" "${ARTIFACT}.tar.gz.sha256"; do
+            curl -fsSL --retry 3 -o "artifacts/${file}" "${base}/${file}"
+          done
+          (cd artifacts && sha256sum -c "${ARTIFACT}.tar.gz.sha256")
+          tar -xzf "artifacts/${ARTIFACT}.tar.gz" -C "dist/docker/${ARTIFACT}"
+          "dist/docker/${ARTIFACT}/ai-memory" --version | grep -Fx "ai-memory ${VERSION}"
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push image by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          tags: ${{ needs.names.outputs.image }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.tarball.outputs.revision }}
+            org.opencontainers.image.version=${{ needs.names.outputs.version }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DIGEST" ]; then
+            echo "docker build did not return a digest" >&2
+            exit 1
+          fi
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-image-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: manifest + smoke
+    needs: [names, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: fork-image-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish multi-arch manifest
+        env:
+          IMAGE: ${{ needs.names.outputs.image }}
+          IMAGE_TAG: ${{ needs.names.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          refs=()
+          for digest_file in /tmp/digests/*; do
+            refs+=("${IMAGE}@sha256:$(basename "$digest_file")")
+          done
+          if [ "${#refs[@]}" -ne 2 ]; then
+            echo "expected 2 image digests, found ${#refs[@]}" >&2
+            exit 1
+          fi
+          docker buildx imagetools create -t "${IMAGE}:${IMAGE_TAG}" "${refs[@]}"
+          docker buildx imagetools inspect "${IMAGE}:${IMAGE_TAG}"
+
+      - name: Smoke test against the release binaries
+        env:
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+          IMAGE: ${{ needs.names.outputs.image }}
+          IMAGE_TAG: ${{ needs.names.outputs.image_tag }}
+          VERSION: ${{ needs.names.outputs.version }}
+        run: |
+          set -euo pipefail
+          image="${IMAGE}:${IMAGE_TAG}"
+          base="https://github.com/${REPO}/releases/download/${TAG//+/%2B}"
+          for pair in linux/amd64:ai-memory-linux-x86_64 linux/arm64:ai-memory-linux-aarch64; do
+            platform="${pair%%:*}"
+            artifact="${pair#*:}"
+            dir="$(mktemp -d)"
+            for file in "${artifact}.tar.gz" "${artifact}.tar.gz.sha256"; do
+              curl -fsSL --retry 3 -o "${dir}/${file}" "${base}/${file}"
+            done
+            (cd "$dir" && sha256sum -c "${artifact}.tar.gz.sha256")
+            tar -xzf "$dir/${artifact}.tar.gz" -C "$dir" ./ai-memory
+            expected="$(sha256sum "$dir/ai-memory" | awk '{print $1}')"
+            docker pull --platform "$platform" "$image"
+            docker run --rm --platform "$platform" "$image" --version | grep -Fx "ai-memory ${VERSION}"
+            actual="$(docker run --rm --platform "$platform" --entrypoint sha256sum "$image" /usr/local/bin/ai-memory | awk '{print $1}')"
+            if [ "$actual" != "$expected" ]; then
+              echo "${platform}: image binary ${actual} differs from release binary ${expected}" >&2
+              exit 1
+            fi
+            echo "${platform}: ${actual} matches ${artifact}.tar.gz"
+          done
